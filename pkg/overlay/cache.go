@@ -6,7 +6,6 @@ package overlay
 import (
 	"context"
 	"errors"
-	"net"
 	"time"
 
 	"github.com/zeebo/errs"
@@ -59,7 +58,9 @@ type DB interface {
 	PaginateQualified(ctx context.Context, offset int64, limit int) ([]*pb.Node, bool, error)
 	// IsVetted returns whether or not the node reaches reputable thresholds
 	IsVetted(ctx context.Context, id storj.NodeID, criteria *NodeCriteria) (bool, error)
-	// Update updates node address
+	// UpdateAddressAndUptime updates node address and uptime in one transaction, minimizing duplicate calls
+	UpdateAddressAndUptime(ctx context.Context, node *pb.Node, isUp bool, defaults NodeSelectionConfig) error
+	// UpdateAddress updates node address
 	UpdateAddress(ctx context.Context, value *pb.Node, defaults NodeSelectionConfig) error
 	// UpdateStats all parts of single storagenode's stats.
 	UpdateStats(ctx context.Context, request *UpdateRequest) (stats *NodeStats, err error)
@@ -306,11 +307,7 @@ func (cache *Cache) Put(ctx context.Context, nodeID storj.NodeID, value pb.Node)
 	if value.Address == nil {
 		return errors.New("node has no address")
 	}
-	// Resolve IP Address Network to ensure it is set
-	value.LastIp, err = GetNetwork(ctx, value.Address.Address)
-	if err != nil {
-		return OverlayError.Wrap(err)
-	}
+
 	return cache.db.UpdateAddress(ctx, &value, cache.preferences)
 }
 
@@ -381,16 +378,7 @@ func (cache *Cache) ConnSuccess(ctx context.Context, node *pb.Node) {
 	var err error
 	defer mon.Task()(&ctx)(&err)
 
-	err = cache.Put(ctx, node.Id, *node)
-	if err != nil {
-		zap.L().Debug("error updating uptime for node", zap.Error(err))
-	}
-
-	lambda := cache.preferences.UptimeReputationLambda
-	weight := cache.preferences.UptimeReputationWeight
-	uptimeDQ := cache.preferences.UptimeReputationDQ
-
-	_, err = cache.db.UpdateUptime(ctx, node.Id, true, lambda, weight, uptimeDQ)
+	err = cache.db.UpdateAddressAndUptime(ctx, node, true, cache.preferences)
 	if err != nil {
 		zap.L().Debug("error updating node connection info", zap.Error(err))
 	}
@@ -416,41 +404,4 @@ func (cache *Cache) GetMissingPieces(ctx context.Context, pieces []*pb.RemotePie
 		}
 	}
 	return missingPieces, nil
-}
-
-func getIP(ctx context.Context, target string) (ip net.IPAddr, err error) {
-	defer mon.Task()(&ctx)(&err)
-	host, _, err := net.SplitHostPort(target)
-	if err != nil {
-		return net.IPAddr{}, err
-	}
-	ipAddr, err := net.ResolveIPAddr("ip", host)
-	if err != nil {
-		return net.IPAddr{}, err
-	}
-	return *ipAddr, nil
-}
-
-// GetNetwork resolves the target address and determines its IP /24 Subnet
-func GetNetwork(ctx context.Context, target string) (network string, err error) {
-	defer mon.Task()(&ctx)(&err)
-
-	addr, err := getIP(ctx, target)
-	if err != nil {
-		return "", err
-	}
-
-	// If addr can be converted to 4byte notation, it is an IPv4 address, else its an IPv6 address
-	if ipv4 := addr.IP.To4(); ipv4 != nil {
-		//Filter all IPv4 Addresses into /24 Subnet's
-		mask := net.CIDRMask(24, 32)
-		return ipv4.Mask(mask).String(), nil
-	}
-	if ipv6 := addr.IP.To16(); ipv6 != nil {
-		//Filter all IPv6 Addresses into /64 Subnet's
-		mask := net.CIDRMask(64, 128)
-		return ipv6.Mask(mask).String(), nil
-	}
-
-	return "", errors.New("unable to get network for address " + addr.String())
 }
